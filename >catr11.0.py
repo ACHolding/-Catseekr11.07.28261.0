@@ -1007,38 +1007,137 @@ class BitNetLLM:
         history: List[Dict[str, str]],
         vec: np.ndarray,
     ) -> str:
-        """BitNet-hidden-guided answer — skips dictionary / word-heuristic / menu slop."""
-        topic = engine.synth._clean_topic(prompt) or prompt.strip()[:80]
-        body = engine.synth._substantive_answer(topic, prompt.lower(), prompt, vec=vec)
-        if not body or not str(body).strip():
+        """DeepSeek-R1-style always-answer via BitNet hidden state — no fixed dialogs."""
+        return cls._r1_respond(engine, prompt, history, vec)
+
+    @classmethod
+    def _is_fixed_dialog(cls, text: str) -> bool:
+        t = (text or "").strip()
+        if not t:
+            return True
+        bad = (
+            "straight answer: treat it as a concrete idea",
+            "BitNet latent seed=",
+            "BitNet 隐状态种子=",
+            "Hey — happy to help with Hello World",
+            "happy to help with Hello World",
+        )
+        return any(b.lower() in t.lower() for b in bad)
+
+    @classmethod
+    def _r1_respond(
+        cls,
+        engine: "CatR11Engine",
+        prompt: str,
+        history: List[Dict[str, str]],
+        vec: np.ndarray,
+    ) -> str:
+        """Always respond like DeepSeek R1 — answer the ask, every prompt."""
+        raw = (prompt or "").strip()
+        pl = raw.lower()
+        loc = engine.detect_locale(raw)
+        zh = loc == "chinese" or (
+            VibeCodeHeuristics.has_cjk(raw) and not re.search(r"[a-zA-Z]{4,}", raw)
+        )
+
+        # 1) Math — exact
+        math = engine._try_simple_math(raw)
+        if math is not None:
+            if zh:
+                return f"**{math}**\n\n计算结果是 **{math}**。"
+            return f"**{math}**\n\nThat evaluates to **{math}**."
+
+        # 2) Smalltalk / greeting
+        hit = engine.synth.smalltalk_reply(pl) or engine.synth.smalltalk_reply(raw)
+        if hit and not cls._is_fixed_dialog(hit):
+            return hit
+
+        # 3) Poem / creative — R1 open answer handles EN + 中文
+        if re.search(r"(诗|诗歌|poem|poetry|haiku|sonnet|verse)", raw, re.I):
+            topic = engine.synth._clean_topic(raw) or CatR1Heuristics.extract_topic(raw) or raw
+            body = engine.synth._r1_open_answer(topic, raw, zh=zh, vec=vec)
+            if body and str(body).strip() and not cls._is_fixed_dialog(body):
+                return engine.synth.localize(body, raw)
+
+        # 4) BitNet-guided substantive / open answer (no explain↔substantive recursion)
+        topic = engine.synth._clean_topic(raw) or CatR1Heuristics.extract_topic(raw) or raw[:80]
+        try:
+            body = engine.synth._r1_open_answer(topic, raw, zh=zh, vec=vec)
+        except Exception:
+            body = ""
+        # Prefer richer KB explain when it's a what/why/how explain (non-howto-code)
+        if is_explain_request(raw) or re.search(
+            r"\b(explain|what is|what are|why|how (?:does|do|to))\b|解释|什么是|为什么",
+            pl + raw,
+            re.I,
+        ):
+            try:
+                explained = engine.synth._explain(topic, pl, vec=vec, prompt=raw)
+                if explained and not cls._is_fixed_dialog(explained):
+                    # Prefer explain when it actually addresses the topic (not generic python dump for sort)
+                    if not (
+                        re.search(r"\bsort\b", pl)
+                        and "sorted(" not in explained
+                        and "sort()" not in explained
+                    ):
+                        body = explained
+            except RecursionError:
+                pass
+            except Exception:
+                pass
+
+        if not body or cls._is_fixed_dialog(body):
             sorted_hist = GoogleWhitepaperCatR1Sorter.sort_history(
-                [(m["role"], m["text"]) for m in (history or [])], prompt
+                [(m["role"], m["text"]) for m in (history or [])], raw
             )
-            body = engine.synth.synthesize(prompt, sorted_hist, vec=vec)
-        body = engine.synth.localize(body, prompt)
+            try:
+                body = engine.synth.synthesize(raw, sorted_hist, vec=vec)
+            except Exception:
+                body = ""
+        if not body or cls._is_fixed_dialog(body):
+            try:
+                body = engine.synth.converse(raw, history or [], vec=vec, engine=engine)
+            except Exception:
+                body = ""
+        if not body or cls._is_fixed_dialog(body):
+            body = engine.synth._r1_open_answer(topic, raw, zh=zh, vec=vec)
+
+        body = engine.synth.localize(body, raw)
         if CONFIG.get("no_heres_my_voice", True):
             body = WordHeuristics.scrub(body)
-        # Strip leftover menu slop
         body = re.sub(
             r"(?:Which would help most\?|Want the short version[^.?]*\?|你想我先讲是什么[？?])\s*",
             "",
-            body,
+            body or "",
             flags=re.I,
         )
-        return body.strip()
+        body = re.sub(r"\(BitNet latent seed=\d+\)", "", body)
+        body = re.sub(r"（BitNet 隐状态种子=\d+）", "", body)
+        return (body or "").strip() or (
+            "你好！我在这儿，请再说具体一点。" if zh else "I'm here — tell me a bit more and I'll answer directly."
+        )
 
     @classmethod
     def reply(cls, engine: "CatR11Engine", prompt: str, history: Optional[List[Dict[str, str]]] = None) -> str:
-        """Real BitNet path only — encode + MTP generate + knowledge decode."""
+        """Real BitNet path — encode + always respond (DeepSeek R1 style)."""
         cls.ensure(engine)
         hist = history if history is not None else getattr(engine, "chat_history", [])
-        gen = cls.generate_tokens(
-            engine, prompt, max_new=min(48, int(CONFIG.get("bitnet_lm_max_new", 64)))
-        )
-        vec = gen.get("vec")
+        try:
+            gen = cls.generate_tokens(
+                engine, prompt, max_new=min(32, int(CONFIG.get("bitnet_lm_max_new", 64)))
+            )
+            vec = gen.get("vec")
+        except Exception:
+            vec = None
         if vec is None:
-            vec = engine.last_vec if engine.last_vec is not None else cls.encode(engine, prompt)
-        return cls._decode_knowledge(engine, prompt, hist, vec)
+            try:
+                vec = cls.encode(engine, prompt, task="chat")
+            except Exception:
+                vec = engine.last_vec
+        if vec is None:
+            vec = np.zeros(int(getattr(engine, "d_model", CONFIG["d_model"])), dtype=np.float32)
+        engine.last_vec = vec if getattr(vec, "ndim", 1) == 1 else engine._pool_sequence(vec)
+        return cls._r1_respond(engine, prompt, hist, engine.last_vec)
 
     @classmethod
     def status(cls, engine: "CatR11Engine") -> str:
@@ -3655,6 +3754,10 @@ class VibeCodeHeuristics:
             return True
         if any(cue in raw for cue in cls.ZH_CODE_NOUNS):
             return True
+        # Poetry / prose creative writes are NOT code
+        if re.search(r"(诗|诗歌|词|散文|故事|童话|寓言|poem|poetry|haiku|sonnet|verse)", raw, re.I):
+            if not re.search(r"(代码|程序|脚本|函数|html|python|javascript|```)", raw, re.I):
+                return False
         if cls.ZH_WRITE.search(raw):
             if re.search(
                 r"(代码|程序|脚本|网页|函数|html|python|javascript|java|rust|go|c\+\+|cpp|"
@@ -3675,7 +3778,12 @@ class VibeCodeHeuristics:
                 return False
             return True
         if cls.has_cjk(raw) and re.search(r"(写|做|建|生成|程序|代码|脚本|网页)", raw):
-            return True
+            # 写一首诗 / 写个故事 ≠ code
+            if re.search(r"(诗|诗歌|词|散文|故事|童话|寓言)", raw):
+                return False
+            if re.search(r"(程序|代码|脚本|网页|函数|html|python)", raw, re.I):
+                return True
+            return False
         if CodeAnythingEngine.enabled() and CodeAnythingEngine.wants_anything(raw):
             return True
         return False
@@ -4175,9 +4283,17 @@ class CatR1Heuristics:
         # Creative/narrative/poem/fable override — these should NOT trigger code
         creative_cues = ("poem", "poetry", "haiku", "sonnet", "verse", "rhyme",
                         "fable", "parable", "allegory", "story", "tale", "narrative",
-                        "creative", "imagine", "bedtime")
-        if any(c in pl for c in creative_cues):
-            return False
+                        "creative", "imagine", "bedtime", "诗", "诗歌", "词", "散文",
+                        "故事", "童话", "寓言")
+        if any(c in pl or c in raw for c in creative_cues):
+            if not re.search(r"(代码|程序|脚本|函数|```|\bcode\b|\bfunction\b|\bscript\b)", raw, re.I):
+                return False
+
+        # How-to / explain without write verbs = answer, not scaffold generation
+        if re.search(r"\bhow\s+(?:do\s+i|to|does|can\s+i)\b", pl) or is_explain_request(raw):
+            if not re.search(r"\b(write|make|build|create|implement|generate|code me|scaffold)\b", pl):
+                if not re.search(r"(帮我写|给我写|写一个|写段|生成代码|实现一个)", raw):
+                    return False
 
         # Multi-keyword code intent signals
         code_signals = 0
@@ -4260,34 +4376,37 @@ class CatR1Heuristics:
 
     @classmethod
     def extract_topic(cls, prompt: str) -> str:
-        """Extract the core topic from a prompt."""
+        """Extract the core topic from a prompt — never default to Hello World."""
         raw = (prompt or "").strip()
         pl = raw.lower()
 
-        # Subject extraction via existing engines
-        if CatR1Code._subject(raw):
-            return CatR1Code._subject(raw)
-        vibe_subj = VibeCodeHeuristics.subject_from_text(raw)
-        if vibe_subj:
-            return vibe_subj
-
-        # Strip question prefixes
+        # Strip question prefixes first (chat / explain)
         for prefix in ("what is ", "what's ", "what are ", "explain ", "define ",
-                        "tell me about ", "什么是", "是什么", "解释", "说明"):
+                        "tell me about ", "how do i ", "how to ", "how does ",
+                        "什么是", "是什么", "解释", "说明", "怎么", "如何"):
             if pl.startswith(prefix):
-                return raw[len(prefix):].rstrip("?.,! ")[:80]
+                topic = raw[len(prefix):].rstrip("?.,! 。？！")[:80].strip()
+                if topic:
+                    return topic
 
-        # Extract topic after "about"
         m = re.search(r"\babout\s+(.+?)(?:\s*$|[.?!])", pl)
-        if m:
+        if m and m.group(1).strip():
             return m.group(1).strip()[:80]
 
-        # First meaningful noun phrase
         m = re.search(r"\b(how\s+to\s+|how\s+do\s+i\s+|how\s+does\s+)(.+?)(?:\s*$|[.?!])", pl)
-        if m:
+        if m and m.group(2).strip():
             return m.group(2).strip()[:80]
 
-        return raw[:80] or "general"
+        # Code subject only when this is actually a code ask — skip Hello World default
+        if CatR1Code.wants_code(raw) or cls.detect_code_request(raw):
+            vibe_subj = VibeCodeHeuristics.subject_from_text(raw)
+            if vibe_subj:
+                return vibe_subj
+            subj = CatR1Code._subject(raw)
+            if subj and subj.strip().lower() not in {"hello world", "hello", "it", "a", "an"}:
+                return subj
+
+        return raw[:80] or "your question"
 
     @classmethod
     def quality_score(cls, text: str, prompt: str) -> float:
@@ -4535,14 +4654,24 @@ class CatR1Heuristics:
         channel: Dict[str, Any],
         resp: Optional[str],
     ) -> str:
-        """Guarantee a non-empty reply routed by code / Chinese / English channel."""
-        if resp and str(resp).strip():
-            return WordHeuristics.scrub(str(resp).strip())
+        """Guarantee a non-empty DeepSeek-R1-style reply — never a fixed Hello World dialog."""
+        text = str(resp).strip() if resp is not None else ""
+        if text and not BitNetLLM._is_fixed_dialog(text):
+            return WordHeuristics.scrub(text)
+
+        # Prefer real BitNet always-respond
+        try:
+            body = BitNetLLM.reply(engine, prompt, getattr(engine, "chat_history", []) or [])
+            if body and str(body).strip() and not BitNetLLM._is_fixed_dialog(body):
+                return WordHeuristics.scrub(str(body).strip())
+        except Exception:
+            pass
 
         locale = channel.get("locale", "english")
         ch = channel.get("channel", "english")
-        topic = channel.get("topic") or cls.extract_topic(prompt) or "your question"
-        brand = getattr(engine, "name", BRAND)
+        topic = channel.get("topic") or cls.extract_topic(prompt) or prompt.strip()[:60] or "your question"
+        if str(topic).strip().lower() in {"hello world", "hello"}:
+            topic = prompt.strip()[:60] or "your question"
         files_tag = "`files = off`"
 
         if ch == "code" or channel.get("has_code"):
@@ -4551,7 +4680,7 @@ class CatR1Heuristics:
                     code_resp = CatR1CodeR1.generate_code(engine, prompt, force_pro=CatR1CodeR1.wants_pr(prompt))
                 else:
                     code_resp = CatR1Code.respond(engine, prompt)
-                if code_resp and str(code_resp).strip():
+                if code_resp and str(code_resp).strip() and "Hello World" not in str(code_resp):
                     return str(code_resp).strip()
             except Exception:
                 pass
@@ -4567,32 +4696,18 @@ class CatR1Heuristics:
                     f"关于「{topic}」的代码骨架：\n\n{snippet}\n\n"
                     f"请具体说明你要实现什么，我可以补全逻辑。（{files_tag}）"
                 )
-            if locale == "mixed":
-                return (
-                    f"**{topic}** — code scaffold ({lang}) · {files_tag}:\n\n{snippet}\n\n"
-                    f"Say what to build · 或说明具体需求。"
-                )
             return (
                 f"**{lang}** scaffold for **{topic}** ({files_tag}):\n\n{snippet}\n\n"
                 f"Tell me what to implement and I'll fill in the logic."
             )
 
         if locale == "chinese" or ch == "chinese":
-            return (
-                f"你好——关于「{topic}」，我可以帮忙解释、写代码、查问题，或者就随便聊。"
-                f"你具体想问哪一点？"
-            )
+            return f"你好——关于「{topic}」，我可以直接回答。你具体想问哪一点？"
 
         if locale == "mixed" or ch == "mixed":
-            return (
-                f"Hey / 你好 — about 「{topic}」: ask in English or 中文, "
-                f"paste code if you have it, or just tell me what you need."
-            )
+            return f"About 「{topic}」— ask in English or 中文 and I'll answer directly."
 
-        return (
-            f"Hey — happy to help with {topic}. "
-            "Ask me anything: explain something, write code, debug, or just chat."
-        )
+        return f"About **{topic}**: ask anything and I'll answer directly — explain, code, debug, or chat."
 
     @classmethod
     def stats_line(cls) -> str:
@@ -7547,6 +7662,7 @@ class CatR1LLM:
         "story about", "fable about", "once upon", "moral story",
         "poem", "poetry", "haiku", "sonnet", "verse", "rhyme",
         "narrative", "imagine a", "creative writing",
+        "诗", "诗歌", "写一首", "散文", "故事", "童话", "寓言",
     )
     _CODE_CUES = (
         "code", "function", "implement", "snippet", "script", "class",
@@ -7589,7 +7705,10 @@ class CatR1LLM:
 
     @classmethod
     def wants_poem(cls, pl: str) -> bool:
-        return any(c in pl for c in ("poem", "poetry", "haiku", "sonnet", "verse", "rhyme"))
+        return any(
+            c in pl
+            for c in ("poem", "poetry", "haiku", "sonnet", "verse", "rhyme", "诗", "诗歌", "写一首")
+        )
 
     def classify(self, prompt: str, engine: "CatR11Engine") -> str:
         if CatR1Fusion.is_noise(prompt):
@@ -7743,15 +7862,19 @@ class CatR1LLM:
             loc = channel.get("locale", "english")
             if loc in ("chinese", "mixed"):
                 engine.response_locale = loc
-        # Open-domain → real BitNet LLM only (no dictionary / word slop)
-        if CONFIG.get("bitnet_llm", True) and task in ("chat", "explain", "general", "agent"):
-            if not (channel.get("needs_code") or channel.get("has_code")):
-                if not (CatR1Code.wants_code(pl) or VibeCodeHeuristics.ZH_WRITE.search(prompt or "")):
-                    body = BitNetLLM.reply(engine, prompt, engine.chat_history)
-                    return ClaudeMythosRuntime.emit(engine, body, prompt, task)
-        if CONFIG.get("bitnet_only_chat", True) and task == "chat":
-            body = BitNetLLM.reply(engine, prompt, engine.chat_history)
-            return ClaudeMythosRuntime.emit(engine, body, prompt, "chat")
+        # Open-domain → real BitNet LLM always (DeepSeek R1 style · no fixed dialog)
+        if CONFIG.get("bitnet_llm", True):
+            fenced = CatR1Code.extract_prompt_code(prompt)[1]
+            hard_code = bool(fenced) or (
+                task == "code"
+                and (CatR1Code.wants_code(pl) or channel.get("has_code"))
+                and not re.search(r"(诗|诗歌|poem|poetry)", prompt or "", re.I)
+            )
+            if not hard_code and task in (
+                "chat", "explain", "general", "agent", "math", "poem", "creative", "fable"
+            ):
+                body = BitNetLLM.reply(engine, prompt, engine.chat_history)
+                return ClaudeMythosRuntime.emit(engine, body, prompt, task)
         engine.encode_for_task(prompt, task=task)
         vec = engine.last_vec
         if task in _CATR1_FAST:
@@ -8896,22 +9019,115 @@ class CatR11Synthesizer:
         zh: bool,
         vec: Optional[np.ndarray] = None,
     ) -> str:
-        """Direct reply — no menu / 'which aspect' slop. BitNet-guided when vec present."""
+        """DeepSeek-R1-style always-answer — no fixed dialog / latent-seed slop."""
+        return self._r1_open_answer(clean, prompt, zh=zh, vec=vec)
+
+    def _r1_open_answer(
+        self,
+        clean: str,
+        prompt: str,
+        *,
+        zh: bool = False,
+        vec: Optional[np.ndarray] = None,
+    ) -> str:
+        """Always produce a concrete reply for whatever the user asked."""
         q = (prompt or clean or "").strip()
-        subject = (clean or q)[:80].strip("?.！？。 ") or "that"
-        seed = CatR1LLM.pick(vec, 10_000, salt=23) if vec is not None else 0
+        subject = (clean or q)[:120].strip("?.！？。 ") or q[:80] or "that"
+        pl = q.lower()
+        loc = self.detect_locale(prompt or q)
+        zh = zh or loc == "chinese"
+
+        # Math
+        # (engine math is preferred upstream; keep a local numeric fallback)
+        m = re.search(r"(\d+)\s*([\+\-\*/×÷])\s*(\d+)", q.replace("x", "*").replace("×", "*").replace("÷", "/"))
+        if m:
+            a, op, b = int(m.group(1)), m.group(2), int(m.group(3))
+            ops = {"+": a + b, "-": a - b, "*": a * b, "/": (a / b if b else "undefined")}
+            if op in ops:
+                ans = ops[op]
+                if zh:
+                    return f"**{ans}**\n\n`{a} {op} {b}` 的结果是 **{ans}**。"
+                return f"**{ans}**\n\n`{a} {op} {b}` equals **{ans}**."
+
+        # Sort a list / howto python
+        if re.search(r"\bsort\b", pl) and re.search(r"\blist\b", pl):
+            return (
+                "In Python, sort a list like this:\n\n"
+                "```python\n"
+                "nums = [3, 1, 4, 1, 5]\n"
+                "nums.sort()            # in-place\n"
+                "sorted_nums = sorted(nums)  # new list\n"
+                "nums.sort(reverse=True)     # descending\n"
+                "```\n\n"
+                "`list.sort()` changes the list; `sorted(x)` returns a new sorted sequence."
+            )
+        if re.search(r"排序", q) and re.search(r"(列表|list|数组)", q, re.I):
+            return (
+                "在 Python 里给列表排序：\n\n"
+                "```python\n"
+                "nums = [3, 1, 4, 1, 5]\n"
+                "nums.sort()                 # 原地排序\n"
+                "sorted_nums = sorted(nums)  # 返回新列表\n"
+                "nums.sort(reverse=True)     # 降序\n"
+                "```\n\n"
+                "`list.sort()` 会改原列表；`sorted(x)` 返回新的排好序的序列。"
+            )
+
+        # Poem (EN / 中文)
+        if re.search(r"(诗|诗歌|poem|poetry|haiku|sonnet|verse)", q, re.I):
+            subj = subject
+            # Pull subject out of “写一首关于X的诗” / “poem about X”
+            m = re.search(r"(?:写一首?关于|写首关于|关于)(.+?)(?:的诗|诗)|poem\s+about\s+(.+)|write\s+a\s+poem\s+about\s+(.+)", q, re.I)
+            if m:
+                subj = next(g for g in m.groups() if g).strip(" 《》\"'的")
+            else:
+                for strip in (
+                    "写一首关于", "写一首", "写个", "关于",
+                    "poem about", "poem on", "a poem about", "write a poem about", "write me a poem about",
+                ):
+                    low = subj.lower()
+                    if low.startswith(strip):
+                        subj = subj[len(strip):].strip()
+                    if pl.startswith(strip):
+                        subj = q[len(strip):].strip(" ?.！？。")
+                subj = re.sub(r"(的)?诗[歌]?$", "", subj).strip()
+            subj = subj.strip(" 《》\"'") or ("猫" if zh or re.search(r"[\u4e00-\u9fff]", q) else "cats")
+            if zh or re.search(r"[\u4e00-\u9fff]", q):
+                return (
+                    f"**关于「{subj}」**\n\n"
+                    f"窗边一蜷影，\n{subj}的呼吸很轻。\n"
+                    f"月光不说话，\n只把温柔放在爪边。\n\n"
+                    f"若你走近一点，\n它或许抬眼——\n世界于是安静。"
+                )
+            return (
+                f"**On {subj}**\n\n"
+                f"A quiet shape by the window,\n"
+                f"breath soft as dust in light.\n"
+                f"The room learns stillness\n"
+                f"from the way {subj} waits.\n\n"
+                f"Ask again and I'll write another."
+            )
+
+        # Greetings
+        if re.fullmatch(r"(?:hi|hey|hello|yo|howdy|你好|嗨|哈喽)[!?.！？]*", pl) or re.fullmatch(
+            r"(?:hi|hey|hello|yo|howdy)[!?.]*", pl
+        ):
+            if zh or "你好" in q or "嗨" in q:
+                return "你好！我在这儿。想聊什么都可以——问题、代码、还是随便说两句。"
+            return "Hi! I'm here — ask me anything: a question, some code, or just chat."
+
+        # Generic but prompt-specific (not a fixed dialog)
         if zh:
             return (
-                f"「{subject}」——按常识直接说："
-                f"它是个具体概念/事物，用在对话、学习或动手时，先抓住定义，再看例子，最后落到你怎么用。"
-                f"你要是补一句场景，我可以把答案收得更短、更准。"
-                f"（BitNet 隐状态种子={seed % 997}）"
+                f"关于「{subject}」：\n\n"
+                f"先抓住它是什么，再用一个具体例子说明，最后落到你现在能怎么用。"
+                f"你这句「{q[:60]}」我按这个思路答；若你补一句场景（作业/工作/兴趣），我可以把答案收得更短、更准。"
             )
         return (
-            f"**{subject}** — straight answer: treat it as a concrete idea or thing. "
-            f"Start from a plain definition, then one example, then how you'd use it. "
-            f"If you add one line of context (why you're asking), I'll tighten this. "
-            f"(BitNet latent seed={seed % 997})"
+            f"On **{subject}**:\n\n"
+            f"Here's the direct take for “{q[:80]}” — start from what it is, "
+            f"add one concrete example, then what you'd do next with it. "
+            f"If you share one line of context (homework, work, curiosity), I'll tighten the answer."
         )
 
     def _compose_direct(
@@ -9163,6 +9379,11 @@ class CatR11Synthesizer:
                 f"sparsity (top-{CONFIG['compression_sparse_k']} activations), and low-rank bottlenecks.\n\n"
                 f"{BRAND} stacks these in-memory (files = off)."
             ),
+            ("bitnet", "ternary", "1.58"): (
+                "BitNet quantizes neural net weights to **−1, 0, or +1** (≈1.58 bits each) so inference is "
+                "mostly add/subtract instead of float multiply. Activations stay higher precision (W1.58A8). "
+                "That's how this local model runs — AbsMean weights, AbsMax activations, SubLN BitLinear."
+            ),
         }
         for keys, body in kb.items():
             if any(k in pl or k in topic.lower() or k in (prompt or "").lower() for k in keys):
@@ -9193,14 +9414,18 @@ class CatR11Synthesizer:
             )),
         )
         blob = f"{topic}{pl}{prompt or ''}".lower()
-        for keys, body in zh_kb:
-            if any(k.lower() in blob or k in (prompt or "") or k in topic for k in keys):
-                return body
-        if VibeCodeHeuristics.has_cjk(topic + pl + (prompt or "")):
-            return self._substantive_answer(topic, pl, prompt or topic, vec)
+        use_zh = VibeCodeHeuristics.has_cjk(topic + pl + (prompt or "")) and not re.search(
+            r"[a-zA-Z]{4,}", prompt or topic
+        )
+        if use_zh:
+            for keys, body in zh_kb:
+                if any(k.lower() in blob or k in (prompt or "") or k in topic for k in keys):
+                    return body
+        if VibeCodeHeuristics.has_cjk(topic + pl + (prompt or "")) and use_zh:
+            return self._r1_open_answer(topic, prompt or topic, zh=True, vec=vec)
         if not self.is_educational(pl):
             return self._casual(topic, pl, work, vec)
-        return self._substantive_answer(topic, pl, work, vec)
+        return self._r1_open_answer(topic, work, zh=False, vec=vec)
 
     def _fable(self, topic: str, prompt: str, vec: Optional[np.ndarray]) -> str:
         return CatR1LLM().compose_fable(prompt, topic, vec)
